@@ -33,6 +33,10 @@ Linux
 ```bash
 ~/.FreeCAD/Mod
 ```
+or
+```bash
+~/.local/share/FreeCAD/Mod
+```
 
 macOS
 ```bash
