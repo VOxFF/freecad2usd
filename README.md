@@ -79,7 +79,7 @@ Restart FreeCAD after installing the plug-in.
 4. In the file type dropdown, choose “USD (*.usd *.usda)”.
 5. Pick a file name (e.g. my_model.usda) and save.
 
-## Use your USD
+## Load your USD
 
 Open the resulting file in usdview:
 ```bash
