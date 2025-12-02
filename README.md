@@ -62,7 +62,7 @@ Put your plugin files there, e.g.:
 FreeCAD_USD_Exporter/
   ├── Init.py
   ├── InitGui.py        # if you add toolbar / menu command
-  ├── export_usd.py     # main exporter implementation
+  ├── UsdExporter.py    # main exporter implementation
   └── README.md
 ```
 
