@@ -25,20 +25,115 @@ def export(objects, filename):
     root = UsdGeom.Xform.Define(stage, "/Scene")
 
     for obj in objects:
-        if hasattr(obj, "Shape") or hasattr(obj, "Mesh"):
-            export_object(obj, root, stage)
+        export_object_recursive(obj, root, stage)
+        # if hasattr(obj, "Shape") or hasattr(obj, "Mesh"):
+        #     export_object(obj, root, stage)
+
 
     stage.GetRootLayer().Save()
 
 
-def make_usd_safe(name: str) -> str:
-    name = name.strip() or "Object"
-    # replace illegal chars with '_'
-    name = re.sub(r'[^A-Za-z0-9_]', '_', name)
-    # USD prim names cannot start with a digit
-    if name[0].isdigit():
-        name = "_" + name
-    return name
+def export_object(obj, parent_xform, stage):
+    # Debug info
+    FreeCAD.Console.PrintMessage(
+        f"[USD] Exporting: Label='{obj.Label}'  Name='{obj.Name}'\n"
+    )
+
+    usd_name = make_usd_safe(obj.Label or obj.Name)
+    if hasattr(obj, "Mesh") and obj.Mesh.Facets:
+        FreeCAD.Console.PrintMessage("as Mesh")
+        usd_mesh = original_mesh_with_normals_to_usd(obj.Mesh, stage, parent_xform, usd_name,angle_threshold=10.0)
+
+    elif hasattr(obj, "Shape") and not obj.Shape.isNull():
+        # Build the USD mesh from the FreeCAD shape via tessellation
+        FreeCAD.Console.PrintMessage("as tessellated Shape")
+        usd_mesh = tessellated_mesh_with_normals_to_usd(obj.Shape, stage, parent_xform, usd_name, tess_tol=0.1, angle_threshold=10.0)
+
+    else:
+        FreeCAD.Console.PrintMessage("Skipping: no mesh or shape")
+
+    # Placement (FreeCAD → USD transform)
+    pl = obj.Placement
+    pos = pl.Base
+    q = pl.Rotation.Q  # (w, x, y, z)
+
+    xform = UsdGeom.Xform(usd_mesh.GetPrim())
+    xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
+    xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
+
+
+def export_object_recursive(obj, parent_xform, stage):
+    FreeCAD.Console.PrintMessage(
+        f"[USD] Exporting object: Label='{obj.Label}'  Name='{obj.Name}'\n"
+    )
+
+    usd_name = make_usd_safe(obj.Label or obj.Name)
+
+    # Create USD Xform node for this object
+    this_path = parent_xform.GetPath().AppendChild(usd_name)
+    this_xform = UsdGeom.Xform.Define(stage, this_path)
+
+    # Apply object local transform
+    if hasattr(obj, "Placement"):
+        pl = obj.Placement
+        pos = pl.Base
+        q = pl.Rotation.Q  # (w, x, y, z)
+        this_xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
+        this_xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
+
+    # Export geometry if present
+    mesh_name = usd_name + "_mesh"
+
+    if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None):
+        if obj.Mesh.Facets:
+            FreeCAD.Console.PrintMessage("as Mesh\n")
+            original_mesh_with_normals_to_usd(
+                obj.Mesh,
+                stage,
+                this_xform,
+                mesh_name,
+                angle_threshold=10.0
+            )
+
+    elif hasattr(obj, "Shape") and not obj.Shape.isNull():
+        FreeCAD.Console.PrintMessage("as tessellated Shape\n")
+        tessellated_mesh_with_normals_to_usd(
+            obj.Shape,
+            stage,
+            this_xform,
+            mesh_name,
+            tess_tol=0.1,
+            angle_threshold=10.0
+        )
+
+    else:
+        FreeCAD.Console.PrintMessage("Skipping: no mesh or shape\n")
+
+    # Recurse into children
+    for child in get_children(obj):
+        vo = getattr(child, "ViewObject", None)
+        if vo and not vo.Visibility:
+            continue
+        export_object_recursive(child, this_xform, stage)
+
+def get_children(obj):
+    children = []
+    seen = set()
+
+    if hasattr(obj, "Group") and obj.Group:
+        for ch in obj.Group:
+            if ch not in seen:
+                children.append(ch)
+                seen.add(ch)
+
+    if hasattr(obj, "OutList"):
+        for ch in obj.OutList:
+            if ch not in seen:
+                children.append(ch)
+                seen.add(ch)
+
+    return children
+
 
 """
 This functon is used for:
@@ -306,30 +401,13 @@ def original_mesh_with_normals_to_usd(
 
     return usd_mesh
 
-def export_object(obj, parent_xform, stage):
-    # Debug info
-    FreeCAD.Console.PrintMessage(
-        f"[USD] Exporting: Label='{obj.Label}'  Name='{obj.Name}'\n"
-    )
 
-    usd_name = make_usd_safe(obj.Label or obj.Name)
-    if hasattr(obj, "Mesh") and obj.Mesh.Facets:
-        FreeCAD.Console.PrintMessage("as Mesh")
-        usd_mesh = original_mesh_with_normals_to_usd(obj.Mesh, stage, parent_xform, usd_name,angle_threshold=10.0)
 
-    elif hasattr(obj, "Shape") and not obj.Shape.isNull():
-        # Build the USD mesh from the FreeCAD shape via tessellation
-        FreeCAD.Console.PrintMessage("as tessellated Shape")
-        usd_mesh = tessellated_mesh_with_normals_to_usd(obj.Shape, stage, parent_xform, usd_name, tess_tol=0.1, angle_threshold=10.0)
-
-    else:
-        FreeCAD.Console.PrintMessage("Skipping: no mesh or shape")
-
-    # Placement (FreeCAD → USD transform)
-    pl = obj.Placement
-    pos = pl.Base
-    q = pl.Rotation.Q  # (w, x, y, z)
-
-    xform = UsdGeom.Xform(usd_mesh.GetPrim())
-    xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
-    xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
+def make_usd_safe(name: str) -> str:
+    name = name.strip() or "Object"
+    # replace illegal chars with '_'
+    name = re.sub(r'[^A-Za-z0-9_]', '_', name)
+    # USD prim names cannot start with a digit
+    if name[0].isdigit():
+        name = "_" + name
+    return name
