@@ -26,9 +26,6 @@ def export(objects, filename):
 
     for obj in objects:
         export_object_recursive(obj, root, stage)
-        # if hasattr(obj, "Shape") or hasattr(obj, "Mesh"):
-        #     export_object(obj, root, stage)
-
 
     stage.GetRootLayer().Save()
 
@@ -63,17 +60,42 @@ def export_object(obj, parent_xform, stage):
 
 
 def export_object_recursive(obj, parent_xform, stage):
+    """
+    Export a FreeCAD object into USD:
+
+      - App::Part / Groups:
+          * container Xforms (no mesh)
+          * recurse into children
+
+      - PartDesign::Body:
+          * one mesh from Body.Shape under the Body Xform
+          * NO recursion into PartDesign features (Pad, Chamfer, etc.)
+
+      - Mesh::Feature:
+          * Xform + mesh from obj.Mesh
+
+      - Part::Feature:
+          * Xform + mesh from obj.Shape (tessellated)
+
+      - Other types:
+          * try Mesh, then Shape
+          * otherwise treated as container only
+
+    Children are discovered via get_children(obj) and exported recursively.
+    """
+    type_id = getattr(obj, "TypeId", "")
+    label   = getattr(obj, "Label", "") or getattr(obj, "Name", "")
+    usd_name = make_usd_safe(label)
+
     FreeCAD.Console.PrintMessage(
-        f"[USD] Exporting object: Label='{obj.Label}'  Name='{obj.Name}'\n"
+        f"[USD] Exporting: Label='{label}'  Name='{obj.Name}'  TypeId='{type_id}'\n"
     )
 
-    usd_name = make_usd_safe(obj.Label or obj.Name)
-
-    # Create USD Xform node for this object
+    # Create Xform for this object under its parent
     this_path = parent_xform.GetPath().AppendChild(usd_name)
     this_xform = UsdGeom.Xform.Define(stage, this_path)
 
-    # Apply object local transform
+    # Apply local placement (if any)
     if hasattr(obj, "Placement"):
         pl = obj.Placement
         pos = pl.Base
@@ -81,12 +103,45 @@ def export_object_recursive(obj, parent_xform, stage):
         this_xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
         this_xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
 
-    # Export geometry if present
-    mesh_name = usd_name + "_mesh"
 
-    if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None):
-        if obj.Mesh.Facets:
-            FreeCAD.Console.PrintMessage("as Mesh\n")
+    # Case Part – container only
+    if type_id.startswith("App::Part"):
+        FreeCAD.Console.PrintMessage("  -> App::Part, container only\n")
+        # no own mesh, just recurse into children below
+
+    # Case Group(s) – container only
+    elif ("DocumentObjectGroup" in type_id) or ("GeoFeatureGroup" in type_id) or (
+        hasattr(obj, "Group")
+        and getattr(obj, "Group")
+        and not hasattr(obj, "Shape")
+        and not hasattr(obj, "Mesh")
+    ):
+        FreeCAD.Console.PrintMessage("  -> Group, container only\n")
+        # no own mesh, just recurse
+
+    # Case PartDesign::Body – one mesh from Body.Shape, no recursion into features
+    elif type_id == "PartDesign::Body":
+        if hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> PartDesign::Body, exporting Body.Shape as mesh\n")
+            mesh_name = usd_name + "_mesh"
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> PartDesign::Body has no valid Shape\n")
+
+        return
+
+    # Case Mesh::Feature – original triangulation
+    elif type_id.startswith("Mesh::Feature"):
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
+            FreeCAD.Console.PrintMessage("  -> Mesh::Feature, exporting original Mesh\n")
+            mesh_name = usd_name + "_mesh"
             original_mesh_with_normals_to_usd(
                 obj.Mesh,
                 stage,
@@ -94,26 +149,59 @@ def export_object_recursive(obj, parent_xform, stage):
                 mesh_name,
                 angle_threshold=10.0
             )
+        else:
+            FreeCAD.Console.PrintMessage("  -> Mesh::Feature has no facets\n")
 
-    elif hasattr(obj, "Shape") and not obj.Shape.isNull():
-        FreeCAD.Console.PrintMessage("as tessellated Shape\n")
-        tessellated_mesh_with_normals_to_usd(
-            obj.Shape,
-            stage,
-            this_xform,
-            mesh_name,
-            tess_tol=0.1,
-            angle_threshold=10.0
-        )
+    # Case Part::Feature – classic solids, extrudes, etc.
+    elif type_id.startswith("Part::Feature"):
+        if hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> Part::Feature, exporting tessellated Shape\n")
+            mesh_name = usd_name + "_mesh"
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> Part::Feature has no valid Shape\n")
 
+    # Fallback – try Mesh then Shape, else container
     else:
-        FreeCAD.Console.PrintMessage("Skipping: no mesh or shape\n")
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
+            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Mesh property\n")
+            mesh_name = usd_name + "_mesh"
+            original_mesh_with_normals_to_usd(
+                obj.Mesh,
+                stage,
+                this_xform,
+                mesh_name,
+                angle_threshold=10.0
+            )
+        elif hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Shape via tessellation\n")
+            mesh_name = usd_name + "_mesh"
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> no Mesh/Shape, container only\n")
 
-    # Recurse into children
+    # recurse into children ----------
+
     for child in get_children(obj):
         vo = getattr(child, "ViewObject", None)
         if vo and not vo.Visibility:
+            # skip invisible children (often intermediate features)
             continue
+
         export_object_recursive(child, this_xform, stage)
 
 def get_children(obj):
