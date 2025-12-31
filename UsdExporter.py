@@ -1,9 +1,9 @@
 import sys, os
 import re
+import math
 
 import FreeCAD
 import FreeCADGui
-import math
 
 # Ensure USD Python bindings (pxr) are visible to FreeCAD's Python
 usd_python_path = os.path.expanduser('~/usd_install/lib/python')
@@ -13,196 +13,67 @@ if usd_python_path not in sys.path:
 from pxr import Usd, UsdGeom, Gf
 
 
+# If True, convert tessellated points into prim-local space by applying inverse(globalPlacement)
+UNBAKE_POINTS_TO_LOCAL = True
+
+
+# ----------------------------
+# Debug helpers
+# ----------------------------
+
+def _quat_xyzw(pl: FreeCAD.Placement):
+    """
+    FreeCAD Rotation.Q is (x, y, z, w) (NOT w,x,y,z).
+    """
+    q = pl.Rotation.Q
+    return (q[0], q[1], q[2], q[3])  # x,y,z,w
+
+
+def _pl_str(pl):
+    try:
+        b = pl.Base
+        x, y, z, w = _quat_xyzw(pl)
+        return f"T=({b.x:.3f},{b.y:.3f},{b.z:.3f}) Qxyzw=({x:.6f},{y:.6f},{z:.6f},{w:.6f})"
+    except Exception:
+        return "<bad placement>"
+
+
+def _bbox(pts_):
+    if not pts_:
+        return None
+    xs = [p.x for p in pts_]
+    ys = [p.y for p in pts_]
+    zs = [p.z for p in pts_]
+    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+
 def export(objects, filename):
     if not objects:
         doc = FreeCAD.ActiveDocument
         objects = doc.Objects
 
     stage = Usd.Stage.CreateNew(filename)
-    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)  # adjust if you want Y-up
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
-    # Create a root Xform
+    # Optional: FreeCAD is typically mm. Enable later when transforms are correct.
+    # UsdGeom.SetStageMetersPerUnit(stage, 0.001)
+
     root = UsdGeom.Xform.Define(stage, "/Scene")
 
+    identity = FreeCAD.Placement()
     for obj in objects:
-        export_object_recursive(obj, root, stage)
+        export_object_recursive(obj, root, stage, parent_global=identity)
 
     stage.GetRootLayer().Save()
 
 
-def export_object(obj, parent_xform, stage):
-    # Debug info
-    FreeCAD.Console.PrintMessage(
-        f"[USD] Exporting: Label='{obj.Label}'  Name='{obj.Name}'\n"
-    )
+def make_usd_safe(name: str) -> str:
+    name = (name or "").strip() or "Object"
+    name = re.sub(r'[^A-Za-z0-9_]', '_', name)
+    if name[0].isdigit():
+        name = "_" + name
+    return name
 
-    usd_name = make_usd_safe(obj.Label or obj.Name)
-    if hasattr(obj, "Mesh") and obj.Mesh.Facets:
-        FreeCAD.Console.PrintMessage("as Mesh")
-        usd_mesh = original_mesh_with_normals_to_usd(obj.Mesh, stage, parent_xform, usd_name,angle_threshold=10.0)
-
-    elif hasattr(obj, "Shape") and not obj.Shape.isNull():
-        # Build the USD mesh from the FreeCAD shape via tessellation
-        FreeCAD.Console.PrintMessage("as tessellated Shape")
-        usd_mesh = tessellated_mesh_with_normals_to_usd(obj.Shape, stage, parent_xform, usd_name, tess_tol=0.1, angle_threshold=10.0)
-
-    else:
-        FreeCAD.Console.PrintMessage("Skipping: no mesh or shape")
-
-    # Placement (FreeCAD → USD transform)
-    pl = obj.Placement
-    pos = pl.Base
-    q = pl.Rotation.Q  # (w, x, y, z)
-
-    xform = UsdGeom.Xform(usd_mesh.GetPrim())
-    xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
-    xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
-
-
-def export_object_recursive(obj, parent_xform, stage):
-    """
-    Export a FreeCAD object into USD:
-
-      - App::Part / Groups:
-          * container Xforms (no mesh)
-          * recurse into children
-
-      - PartDesign::Body:
-          * one mesh from Body.Shape under the Body Xform
-          * NO recursion into PartDesign features (Pad, Chamfer, etc.)
-
-      - Mesh::Feature:
-          * Xform + mesh from obj.Mesh
-
-      - Part::Feature:
-          * Xform + mesh from obj.Shape (tessellated)
-
-      - Other types:
-          * try Mesh, then Shape
-          * otherwise treated as container only
-
-    Children are discovered via get_children(obj) and exported recursively.
-    """
-    type_id = getattr(obj, "TypeId", "")
-    label   = getattr(obj, "Label", "") or getattr(obj, "Name", "")
-    usd_name = make_usd_safe(label)
-
-    FreeCAD.Console.PrintMessage(
-        f"[USD] Exporting: Label='{label}'  Name='{obj.Name}'  TypeId='{type_id}'\n"
-    )
-
-    # Create Xform for this object under its parent
-    this_path = parent_xform.GetPath().AppendChild(usd_name)
-    this_xform = UsdGeom.Xform.Define(stage, this_path)
-
-    # Apply local placement (if any)
-    if hasattr(obj, "Placement"):
-        pl = obj.Placement
-        pos = pl.Base
-        q = pl.Rotation.Q  # (w, x, y, z)
-        this_xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
-        this_xform.AddOrientOp().Set(Gf.Quatf(q[0], q[1], q[2], q[3]))
-
-
-    # Case Part – container only
-    if type_id.startswith("App::Part"):
-        FreeCAD.Console.PrintMessage("  -> App::Part, container only\n")
-        # no own mesh, just recurse into children below
-
-    # Case Group(s) – container only
-    elif ("DocumentObjectGroup" in type_id) or ("GeoFeatureGroup" in type_id) or (
-        hasattr(obj, "Group")
-        and getattr(obj, "Group")
-        and not hasattr(obj, "Shape")
-        and not hasattr(obj, "Mesh")
-    ):
-        FreeCAD.Console.PrintMessage("  -> Group, container only\n")
-        # no own mesh, just recurse
-
-    # Case PartDesign::Body – one mesh from Body.Shape, no recursion into features
-    elif type_id == "PartDesign::Body":
-        if hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> PartDesign::Body, exporting Body.Shape as mesh\n")
-            mesh_name = usd_name + "_mesh"
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
-                angle_threshold=10.0
-            )
-        else:
-            FreeCAD.Console.PrintMessage("  -> PartDesign::Body has no valid Shape\n")
-
-        return
-
-    # Case Mesh::Feature – original triangulation
-    elif type_id.startswith("Mesh::Feature"):
-        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
-            FreeCAD.Console.PrintMessage("  -> Mesh::Feature, exporting original Mesh\n")
-            mesh_name = usd_name + "_mesh"
-            original_mesh_with_normals_to_usd(
-                obj.Mesh,
-                stage,
-                this_xform,
-                mesh_name,
-                angle_threshold=10.0
-            )
-        else:
-            FreeCAD.Console.PrintMessage("  -> Mesh::Feature has no facets\n")
-
-    # Case Part::Feature – classic solids, extrudes, etc.
-    elif type_id.startswith("Part::Feature"):
-        if hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> Part::Feature, exporting tessellated Shape\n")
-            mesh_name = usd_name + "_mesh"
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
-                angle_threshold=10.0
-            )
-        else:
-            FreeCAD.Console.PrintMessage("  -> Part::Feature has no valid Shape\n")
-
-    # Fallback – try Mesh then Shape, else container
-    else:
-        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
-            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Mesh property\n")
-            mesh_name = usd_name + "_mesh"
-            original_mesh_with_normals_to_usd(
-                obj.Mesh,
-                stage,
-                this_xform,
-                mesh_name,
-                angle_threshold=10.0
-            )
-        elif hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Shape via tessellation\n")
-            mesh_name = usd_name + "_mesh"
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
-                angle_threshold=10.0
-            )
-        else:
-            FreeCAD.Console.PrintMessage("  -> no Mesh/Shape, container only\n")
-
-    # recurse into children ----------
-
-    for child in get_children(obj):
-        vo = getattr(child, "ViewObject", None)
-        if vo and not vo.Visibility:
-            # skip invisible children (often intermediate features)
-            continue
-
-        export_object_recursive(child, this_xform, stage)
 
 def get_children(obj):
     children = []
@@ -223,54 +94,196 @@ def get_children(obj):
     return children
 
 
-"""
-This functon is used for:
-- The object comes from Part or PartDesign workbench
-- The object has a .Shape attribute (exact B-Rep geometry)
-- You need to generate a mesh from analytic surfaces via shape.tessellate()
-- You want control over tessellation tolerance (mesh resolution)
-- You want normals computed from smooth CAD surfaces
-
-This is required for:
-- Solids, extrusions, revolves, lofts, fillets, chamfers
-- Any parametric CAD geometry in FreeCAD
-
-Because these objects have no .Mesh, you MUST tessellate first.
-"""
-def tessellated_mesh_to_usd(shape, stage, parent_xform, usd_name, tess_tol=0.1):
+def get_global_placement(obj, parent_global: FreeCAD.Placement):
     """
-    Tessellate a FreeCAD shape and convert it into a UsdGeom.Mesh
-    under parent_xform. Returns the created UsdGeom.Mesh.
-
-    shape: FreeCAD shape (e.g., obj.Shape)
-    tess_tol: tessellation tolerance (same as used before in shape.tessellate)
+    Prefer FreeCAD's global placement if available. Otherwise, approximate by chaining.
     """
-    # Tessellate: returns (points, faces)
-    pts, faces = shape.tessellate(tess_tol)
+    if hasattr(obj, "getGlobalPlacement"):
+        try:
+            return obj.getGlobalPlacement()
+        except Exception:
+            pass
 
-    # Convert FreeCAD.Vector → (x, y, z)
-    points = [(p.x, p.y, p.z) for p in pts]
+    if hasattr(obj, "Placement"):
+        try:
+            return parent_global.multiply(obj.Placement)
+        except Exception:
+            pass
 
-    faceVertexIndices = []
-    faceVertexCounts = []
+    return parent_global
 
-    for f in faces:
-        # f is a tuple of vertex indices like (i0, i1, i2, ...)
-        faceVertexIndices.extend(f)
-        faceVertexCounts.append(len(f))
 
-    prim_path = parent_xform.GetPath().AppendChild(usd_name)
-    usd_mesh = UsdGeom.Mesh.Define(stage, prim_path)
+def placement_inverse(pl: FreeCAD.Placement) -> FreeCAD.Placement:
+    return pl.inverse()
 
-    usd_mesh.CreateSubdivisionSchemeAttr().Set("none")
-    usd_mesh.CreateFaceVaryingLinearInterpolationAttr().Set("none")
-    usd_mesh.CreateInterpolateBoundaryAttr().Set("none")
 
-    usd_mesh.CreatePointsAttr(points)
-    usd_mesh.CreateFaceVertexIndicesAttr(faceVertexIndices)
-    usd_mesh.CreateFaceVertexCountsAttr(faceVertexCounts)
+def placement_to_usd_ops(xform: UsdGeom.Xform, pl: FreeCAD.Placement):
+    """
+    Author local transform for this prim (relative to parent) using T + Orient.
+    IMPORTANT: FreeCAD quaternion is (x,y,z,w). USD expects (w, x, y, z) for Gf.Quat*.
+    """
+    pos = pl.Base
+    x, y, z, w = _quat_xyzw(pl)
 
-    return usd_mesh
+    xform.ClearXformOpOrder()
+    xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
+    xform.AddOrientOp().Set(Gf.Quatf(w, x, y, z))
+
+
+def transform_point_by_placement_inv(p: FreeCAD.Vector, pl: FreeCAD.Placement) -> FreeCAD.Vector:
+    """
+    Apply inverse placement to a point (world -> local).
+    """
+    inv = pl.inverse()
+    return inv.multVec(p)
+
+
+def export_object_recursive(obj, parent_xform, stage, parent_global: FreeCAD.Placement):
+    type_id = getattr(obj, "TypeId", "")
+    label = getattr(obj, "Label", "") or getattr(obj, "Name", "")
+    usd_name = make_usd_safe(label)
+
+    FreeCAD.Console.PrintMessage(
+        f"[USD] Exporting: Label='{label}'  Name='{getattr(obj,'Name','')}'  TypeId='{type_id}'\n"
+    )
+
+    # Create Xform for this object under its parent
+    this_path = parent_xform.GetPath().AppendChild(usd_name)
+    this_xform = UsdGeom.Xform.Define(stage, this_path)
+
+    # Compute placements
+    child_global = get_global_placement(obj, parent_global)
+    parent_global_inv = placement_inverse(parent_global)
+    local_to_parent = parent_global_inv.multiply(child_global)
+
+    # DEBUG: placements + embedded shape placement
+    FreeCAD.Console.PrintMessage(
+        f"    parent_global   : {_pl_str(parent_global)}\n"
+        f"    child_global    : {_pl_str(child_global)}\n"
+        f"    local_to_parent : {_pl_str(local_to_parent)}\n"
+    )
+    if hasattr(obj, "Shape") and getattr(obj, "Shape", None) and not obj.Shape.isNull():
+        try:
+            FreeCAD.Console.PrintMessage(f"    shape.Placement : {_pl_str(obj.Shape.Placement)}\n")
+        except Exception:
+            FreeCAD.Console.PrintMessage("    shape.Placement : <unavailable>\n")
+
+    placement_to_usd_ops(this_xform, local_to_parent)
+
+    # DEBUG: what we authored to USD (show as xyzw so it matches FreeCAD print)
+    FreeCAD.Console.PrintMessage(f"    USD xform authored: {_pl_str(local_to_parent)}\n")
+
+    # -------------------------
+    # Containers only
+    # -------------------------
+    if type_id.startswith("App::Part"):
+        FreeCAD.Console.PrintMessage("  -> App::Part, container only\n")
+
+    elif ("DocumentObjectGroup" in type_id) or ("GeoFeatureGroup" in type_id) or (
+        hasattr(obj, "Group")
+        and getattr(obj, "Group")
+        and not hasattr(obj, "Shape")
+        and not hasattr(obj, "Mesh")
+    ):
+        FreeCAD.Console.PrintMessage("  -> Group, container only\n")
+
+    # -------------------------
+    # PartDesign::Body (one mesh, no recursion into features)
+    # -------------------------
+    elif type_id == "PartDesign::Body":
+        if hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> PartDesign::Body, exporting Body.Shape as mesh\n")
+            mesh_name = usd_name + "_mesh"
+
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0,
+                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
+                unbake_using_global_placement=child_global,
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> PartDesign::Body has no valid Shape\n")
+        return
+
+    # -------------------------
+    # Mesh::Feature (use existing triangulation)
+    # -------------------------
+    elif type_id.startswith("Mesh::Feature"):
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
+            FreeCAD.Console.PrintMessage("  -> Mesh::Feature, exporting original Mesh\n")
+            mesh_name = usd_name + "_mesh"
+
+            original_mesh_with_normals_to_usd(
+                obj.Mesh,
+                stage,
+                this_xform,
+                mesh_name,
+                angle_threshold=10.0
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> Mesh::Feature has no facets\n")
+
+    # -------------------------
+    # Part::Feature (tessellate)
+    # -------------------------
+    elif type_id.startswith("Part::Feature"):
+        if hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> Part::Feature, exporting tessellated Shape\n")
+            mesh_name = usd_name + "_mesh"
+
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0,
+                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
+                unbake_using_global_placement=child_global,
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> Part::Feature has no valid Shape\n")
+
+    # -------------------------
+    # Fallback
+    # -------------------------
+    else:
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
+            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Mesh property\n")
+            mesh_name = usd_name + "_mesh"
+            original_mesh_with_normals_to_usd(
+                obj.Mesh,
+                stage,
+                this_xform,
+                mesh_name,
+                angle_threshold=10.0
+            )
+        elif hasattr(obj, "Shape") and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Shape via tessellation\n")
+            mesh_name = usd_name + "_mesh"
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0,
+                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
+                unbake_using_global_placement=child_global,
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> no Mesh/Shape, container only\n")
+
+    # recurse into children
+    for child in get_children(obj):
+        vo = getattr(child, "ViewObject", None)
+        if vo and not vo.Visibility:
+            continue
+        export_object_recursive(child, this_xform, stage, parent_global=child_global)
 
 
 def tessellated_mesh_with_normals_to_usd(
@@ -279,62 +292,70 @@ def tessellated_mesh_with_normals_to_usd(
     parent_xform,
     usd_name,
     tess_tol=0.1,
-    angle_threshold=30.0  # degrees
+    angle_threshold=30.0,
+    unbake_points_to_local=False,
+    unbake_using_global_placement=None,
 ):
-    """
-    Tessellate a FreeCAD shape and convert it into a UsdGeom.Mesh with
-    per-face-vertex normals based on a smoothing angle.
+    pts, faces = shape.tessellate(tess_tol)
 
-    shape:          FreeCAD shape (e.g., obj.Shape)
-    tess_tol:       tessellation tolerance (same as used before in shape.tessellate)
-    angle_threshold: faces sharing a vertex are smoothed together if the angle
-                     between their normals is <= angle_threshold (degrees).
-    """
-    # Tessellate: returns (points, faces)
-    pts, faces = shape.tessellate(tess_tol)  # pts: [FreeCAD.Vector], faces: [(i0, i1, i2, ...)]
+    bb0 = _bbox(pts)
+    FreeCAD.Console.PrintMessage(
+        f"    [tess] '{usd_name}' raw bbox: "
+        f"min=({bb0[0]:.3f},{bb0[1]:.3f},{bb0[2]:.3f}) "
+        f"max=({bb0[3]:.3f},{bb0[4]:.3f},{bb0[5]:.3f})\n"
+    )
 
-    # Convert FreeCAD.Vector → (x, y, z)
-    points = [(p.x, p.y, p.z) for p in pts]
+    if unbake_points_to_local and unbake_using_global_placement is not None:
+        pts_local = [transform_point_by_placement_inv(p, unbake_using_global_placement) for p in pts]
+        bb1 = _bbox(pts_local)
+        FreeCAD.Console.PrintMessage(
+            f"    [tess] '{usd_name}' unbaked bbox: "
+            f"min=({bb1[0]:.3f},{bb1[1]:.3f},{bb1[2]:.3f}) "
+            f"max=({bb1[3]:.3f},{bb1[4]:.3f},{bb1[5]:.3f})\n"
+        )
+        FreeCAD.Console.PrintMessage(
+            f"    [tess] '{usd_name}' unbake using global: {_pl_str(unbake_using_global_placement)}\n"
+        )
+
+        points = [(p.x, p.y, p.z) for p in pts_local]
+        pts_for_normals = pts_local
+    else:
+        points = [(p.x, p.y, p.z) for p in pts]
+        pts_for_normals = pts
 
     faceVertexIndices = []
-    faceVertexCounts  = []
-
+    faceVertexCounts = []
     for f in faces:
         faceVertexIndices.extend(f)
         faceVertexCounts.append(len(f))
 
-    # Compute per-face normals
+    # Face normals
     face_normals = []
     for f in faces:
         if len(f) < 3:
-            # degenerate
             face_normals.append(FreeCAD.Vector(0, 0, 0))
             continue
 
-        v0 = pts[f[0]]
-        v1 = pts[f[1]]
-        v2 = pts[f[2]]
+        v0 = pts_for_normals[f[0]]
+        v1 = pts_for_normals[f[1]]
+        v2 = pts_for_normals[f[2]]
 
         n = (v1 - v0).cross(v2 - v0)
         if n.Length > 0:
             n.normalize()
         face_normals.append(n)
 
-    # Build vertex → incident faces adjacency -
-    vertex_faces = {i: [] for i in range(len(pts))}
+    # Vertex -> incident faces
+    vertex_faces = {i: [] for i in range(len(pts_for_normals))}
     for fi, f in enumerate(faces):
         for vi in f:
             vertex_faces[vi].append(fi)
 
-    # Compute face-vertex normals with angle-based smoothing
     cos_threshold = math.cos(math.radians(angle_threshold))
-
-    face_vertex_normals = []  # one normal per entry in faceVertexIndices, same order
+    face_vertex_normals = []
 
     for fi, f in enumerate(faces):
         n_face = face_normals[fi]
-
-        # If face normal is degenerate, just push zero normals for its vertices
         if n_face.Length == 0:
             for _ in f:
                 face_vertex_normals.append((0.0, 0.0, 0.0))
@@ -342,29 +363,21 @@ def tessellated_mesh_with_normals_to_usd(
 
         for vi in f:
             accum = FreeCAD.Vector(0, 0, 0)
-
-            # Consider all faces sharing this vertex
             for adj_fi in vertex_faces[vi]:
                 n_adj = face_normals[adj_fi]
                 if n_adj.Length == 0:
                     continue
-
-                # dot(n_face, n_adj) since both are normalized
-                dot = n_face.dot(n_adj)
-                # If angle between them is <= angle_threshold, include in smoothing group
-                if dot >= cos_threshold:
+                if n_face.dot(n_adj) >= cos_threshold:
                     accum = accum.add(n_adj)
 
-            # Fallback to face normal if something went wrong
             if accum.Length == 0:
-                n = n_face
+                n = FreeCAD.Vector(n_face)
             else:
                 n = accum
                 n.normalize()
 
             face_vertex_normals.append((n.x, n.y, n.z))
 
-    # Create the USD Mesh
     prim_path = parent_xform.GetPath().AppendChild(usd_name)
     usd_mesh = UsdGeom.Mesh.Define(stage, prim_path)
 
@@ -376,36 +389,19 @@ def tessellated_mesh_with_normals_to_usd(
     usd_mesh.CreateFaceVertexIndicesAttr(faceVertexIndices)
     usd_mesh.CreateFaceVertexCountsAttr(faceVertexCounts)
 
-    # Per-face-vertex normals
-    normals_attr = usd_mesh.CreateNormalsAttr(face_vertex_normals)
+    usd_mesh.CreateNormalsAttr(face_vertex_normals)
     usd_mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
 
     return usd_mesh
 
-"""
-This functon is used for:
-- The FreeCAD object is a real Mesh object (Mesh::Feature)
-- The object was imported from STL/OBJ
-- The object was created in the Mesh Workbench
-- The geometry is already triangulated and has no parametric surfaces
-- You want to keep the original triangle structure exactly as-is
-"""
+
 def original_mesh_with_normals_to_usd(
-    mesh,              # FreeCAD Mesh.Mesh (e.g. obj.Mesh)
+    mesh,
     stage,
     parent_xform,
     usd_name,
-    angle_threshold=30.0  # degrees
+    angle_threshold=30.0
 ):
-    """
-    Export a FreeCAD Mesh.Mesh as a UsdGeom.Mesh with per-face-vertex normals.
-
-    - Uses the mesh's existing triangulation (no tessellate()).
-    - Builds face-varying normals with an angle-based smoothing threshold.
-    """
-
-    #  Collect points and faces from FreeCAD mesh
-    # Points are 1-based in FreeCAD mesh; convert to 0-based.
     pts = mesh.Points
     facets = mesh.Facets
 
@@ -413,39 +409,31 @@ def original_mesh_with_normals_to_usd(
 
     faces = []
     for f in facets:
-        # f.PointIndices is a tuple of 1-based indices (i1, i2, i3, ...)
-        idxs = tuple(i - 1 for i in f.PointIndices)
-        faces.append(idxs)
+        faces.append(tuple(i - 1 for i in f.PointIndices))  # 1-based -> 0-based
 
     faceVertexIndices = []
     faceVertexCounts = []
-
     for f in faces:
         faceVertexIndices.extend(f)
         faceVertexCounts.append(len(f))
 
-    # Face normals
     face_normals = []
-    for f, facet in zip(faces, facets):
-        # FreeCAD facet.Normal is already a Vector
-        n = facet.Normal
+    for facet in facets:
+        n = FreeCAD.Vector(facet.Normal)
         if n.Length > 0:
-            n = n.normalize() if hasattr(n, "normalize") else n
-        face_normals.append(FreeCAD.Vector(n))
+            n.normalize()
+        face_normals.append(n)
 
-    # Vertex → incident faces adjacency
     vertex_faces = {i: [] for i in range(len(pts))}
     for fi, f in enumerate(faces):
         for vi in f:
             vertex_faces[vi].append(fi)
 
-    # Face-vertex normals with angle threshold
     cos_threshold = math.cos(math.radians(angle_threshold))
-    face_vertex_normals = []  # 1:1 with faceVertexIndices
+    face_vertex_normals = []
 
     for fi, f in enumerate(faces):
         n_face = face_normals[fi]
-
         if n_face.Length == 0:
             for _ in f:
                 face_vertex_normals.append((0.0, 0.0, 0.0))
@@ -453,29 +441,24 @@ def original_mesh_with_normals_to_usd(
 
         for vi in f:
             accum = FreeCAD.Vector(0, 0, 0)
-
             for adj_fi in vertex_faces[vi]:
                 n_adj = face_normals[adj_fi]
                 if n_adj.Length == 0:
                     continue
-
-                dot = n_face.dot(n_adj)
-                if dot >= cos_threshold:  # angle <= threshold
+                if n_face.dot(n_adj) >= cos_threshold:
                     accum = accum.add(n_adj)
 
             if accum.Length == 0:
-                n = n_face
+                n = FreeCAD.Vector(n_face)
             else:
                 n = accum
                 n.normalize()
 
             face_vertex_normals.append((n.x, n.y, n.z))
 
-    # Create USD mesh
     prim_path = parent_xform.GetPath().AppendChild(usd_name)
     usd_mesh = UsdGeom.Mesh.Define(stage, prim_path)
 
-    # Force polygonal interpretation to use our normals
     usd_mesh.CreateSubdivisionSchemeAttr().Set("none")
     usd_mesh.CreateFaceVaryingLinearInterpolationAttr().Set("none")
     usd_mesh.CreateInterpolateBoundaryAttr().Set("none")
@@ -484,18 +467,7 @@ def original_mesh_with_normals_to_usd(
     usd_mesh.CreateFaceVertexIndicesAttr(faceVertexIndices)
     usd_mesh.CreateFaceVertexCountsAttr(faceVertexCounts)
 
-    normals_attr = usd_mesh.CreateNormalsAttr(face_vertex_normals)
+    usd_mesh.CreateNormalsAttr(face_vertex_normals)
     usd_mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
 
     return usd_mesh
-
-
-
-def make_usd_safe(name: str) -> str:
-    name = name.strip() or "Object"
-    # replace illegal chars with '_'
-    name = re.sub(r'[^A-Za-z0-9_]', '_', name)
-    # USD prim names cannot start with a digit
-    if name[0].isdigit():
-        name = "_" + name
-    return name
