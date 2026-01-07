@@ -249,6 +249,34 @@ def export_object_recursive(obj, parent_xform, stage, parent_global: FreeCAD.Pla
             FreeCAD.Console.PrintMessage("  -> Part::Feature has no valid Shape\n")
 
     # -------------------------
+    # App::Link / external links (export as instance-like leaf)
+    # -------------------------
+    elif type_id.startswith("App::Link"):
+        # Link has its own placement (already handled by local_to_parent above).
+        # The Link's Shape is typically already in *global/world* coords,
+        # so we MUST unbake using the link's global placement (child_global).
+        if hasattr(obj, "Shape") and obj.Shape and not obj.Shape.isNull():
+            FreeCAD.Console.PrintMessage("  -> App::Link, exporting as flattened mesh (no recursion)\n")
+            mesh_name = usd_name + "_mesh"
+
+            tessellated_mesh_with_normals_to_usd(
+                obj.Shape,
+                stage,
+                this_xform,
+                mesh_name,
+                tess_tol=0.1,
+                angle_threshold=10.0,
+                unbake_points_to_local=True,  # force unbake for link
+                unbake_using_global_placement=child_global,  # IMPORTANT: link global
+            )
+        else:
+            FreeCAD.Console.PrintMessage("  -> App::Link has no valid Shape\n")
+
+        # do not recurse into proxy children of the link
+        return
+
+
+    # -------------------------
     # Fallback
     # -------------------------
     else:
