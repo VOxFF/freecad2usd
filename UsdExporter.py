@@ -100,19 +100,19 @@ def get_children(obj):
 
     if hasattr(obj, "Group") and obj.Group:
         for ch in obj.Group:
-            if ch not in seen:
+            if id(ch) not in seen:
                 children.append(ch)
-                seen.add(ch)
+                seen.add(id(ch))
 
-    # Avoid OutList recursion for links (prevents nested proxy trees)
+    # Avoid OutList recursion for links (prevents proxy graph explosions)
     if getattr(obj, "TypeId", "").startswith("App::Link"):
         return children
 
     if hasattr(obj, "OutList"):
         for ch in obj.OutList:
-            if ch not in seen:
+            if id(ch) not in seen:
                 children.append(ch)
-                seen.add(ch)
+                seen.add(id(ch))
 
     return children
 
@@ -222,7 +222,7 @@ def _ensure_prototype_for_target(target_obj, stage):
     proto_xf = UsdGeom.Xform.Define(stage, proto_path)
     proto_xf.ClearXformOpOrder()
 
-    # Use target global placement as the baseline so target local becomes identity in prototype
+    # Baseline = target global placement so target local becomes identity in prototype
     target_global = get_global_placement(target_obj, FreeCAD.Placement())
 
     export_object_recursive(
@@ -239,7 +239,7 @@ def _ensure_prototype_for_target(target_obj, stage):
 
 def _get_single_link_child(obj):
     """
-    Detect 'clone of link' wrapper: object that isn't App::Link but has exactly one App::Link child.
+    Detect wrapper: object that isn't App::Link but has exactly one App::Link child.
     We'll treat wrapper itself as the instance node and avoid nested link prim hierarchy.
     """
     kids = []
@@ -257,6 +257,63 @@ def _get_single_link_child(obj):
 
     link_kids = [k for k in uniq if getattr(k, "TypeId", "").startswith("App::Link")]
     return link_kids[0] if len(link_kids) == 1 else None
+
+
+def _get_clone_base_object(obj):
+    """
+    Try common properties used by FreeCAD clone-like FeaturePython objects.
+    Returns referenced base object if found.
+    """
+    candidates = ["Base", "Object", "Source", "Objects", "LinkedObject", "Link"]
+    for prop in candidates:
+        if not hasattr(obj, prop):
+            continue
+        try:
+            v = getattr(obj, prop)
+        except Exception:
+            continue
+        if v is None:
+            continue
+
+        # list/tuple
+        if isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                continue
+            v0 = v[0]
+            # sometimes stored as (obj, subname)
+            if isinstance(v0, (list, tuple)) and len(v0) > 0:
+                v0 = v0[0]
+            return v0
+
+        return v
+    return None
+
+
+def _resolve_to_link_if_any(obj, max_hops=6):
+    """
+    If obj is a link, returns it.
+    If obj is a wrapper/clone whose base ultimately points to a link, returns that link.
+    Otherwise returns None.
+    """
+    cur = obj
+    seen = set()
+    for _ in range(max_hops):
+        if cur is None:
+            return None
+        if id(cur) in seen:
+            return None
+        seen.add(id(cur))
+
+        tid = getattr(cur, "TypeId", "")
+        if tid.startswith("App::Link"):
+            return cur
+
+        base = _get_clone_base_object(cur)
+        if base is None:
+            return None
+
+        cur = base
+    return None
 
 
 # ----------------------------
@@ -301,25 +358,46 @@ def export_object_recursive(obj, parent_xform, stage, parent_global: FreeCAD.Pla
     placement_to_usd_ops(this_xform, local_to_parent)
     FreeCAD.Console.PrintMessage(f"    USD xform authored: {_pl_str(local_to_parent)}\n")
 
-    # -------------------------
-    # Clone-of-link wrapper: make THIS node the instance, avoid nested link prims
-    # -------------------------
-    link_child = _get_single_link_child(obj)
-    if link_child is not None and not type_id.startswith("App::Link") and not is_prototype_root:
-        target = _resolve_link_chain(link_child)
-        if target is None:
-            FreeCAD.Console.PrintMessage("  -> Link-wrapper has broken target, skipping\n")
+    # ------------------------------------------------------------------
+    # 1) Clone-of-link wrapper (single App::Link child) -> instance here
+    # ------------------------------------------------------------------
+    if not is_prototype_root:
+        link_child = _get_single_link_child(obj)
+        if link_child is not None and not type_id.startswith("App::Link"):
+            target = _resolve_link_chain(link_child)
+            if target is None:
+                FreeCAD.Console.PrintMessage("  -> Link-wrapper has broken target, skipping\n")
+                return
+
+            proto_path = _ensure_prototype_for_target(target, stage)
+            prim = this_xform.GetPrim()
+            prim.GetReferences().AddInternalReference(proto_path)
+            prim.SetInstanceable(True)
             return
 
-        proto_path = _ensure_prototype_for_target(target, stage)
-        prim = this_xform.GetPrim()
-        prim.GetReferences().AddInternalReference(proto_path)
-        prim.SetInstanceable(True)
-        return
+    # ------------------------------------------------------------------
+    # 2) FeaturePython clone that ultimately points to an App::Link
+    #    (this fixes your 'Clone005' case)
+    # ------------------------------------------------------------------
+    if type_id.startswith("Part::FeaturePython") and not is_prototype_root:
+        link_obj = _resolve_to_link_if_any(obj)
+        if link_obj is not None:
+            target = _resolve_link_chain(link_obj)
+            if target is None:
+                FreeCAD.Console.PrintMessage("  -> Clone-of-link has broken target, skipping\n")
+                return
 
-    # -------------------------
-    # App::Link: preserve hierarchy using prototype reference (no baking)
-    # -------------------------
+            proto_path = _ensure_prototype_for_target(target, stage)
+            prim = this_xform.GetPrim()
+            prim.GetReferences().AddInternalReference(proto_path)
+            prim.SetInstanceable(True)
+
+            # Do NOT export baked Shape and do NOT recurse.
+            return
+
+    # ------------------------------------------------------------------
+    # 3) App::Link itself -> instance of prototype
+    # ------------------------------------------------------------------
     if type_id.startswith("App::Link") and not is_prototype_root:
         target = _resolve_link_chain(obj)
         if target is None:
@@ -348,7 +426,6 @@ def export_object_recursive(obj, parent_xform, stage, parent_global: FreeCAD.Pla
 
     # -------------------------
     # PartDesign::Body (one mesh, no recursion into features)
-    # Note: In prototypes we DO want body as mesh (OK).
     # -------------------------
     elif type_id == "PartDesign::Body":
         if hasattr(obj, "Shape") and not obj.Shape.isNull():
