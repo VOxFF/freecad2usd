@@ -59,6 +59,9 @@ def _bbox(pts_):
 # ----------------------------
 
 def export(objects, filename):
+    # cache must be per-export/stage
+    PROTOTYPE_CACHE.clear()
+
     if not objects:
         doc = FreeCAD.ActiveDocument
         objects = doc.Objects
@@ -191,7 +194,14 @@ def _resolve_link_chain(obj):
 
 
 def _get_prototypes_root(stage):
-    return UsdGeom.Xform.Define(stage, str(PROTOTYPES_ROOT_PATH))
+    xf = UsdGeom.Xform.Define(stage, str(PROTOTYPES_ROOT_PATH))
+
+    # Hide in render (applies only to this container, not to instances)
+    UsdGeom.Imageable(xf.GetPrim()).GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+    # Hide in usdview tree UI 
+    xf.GetPrim().SetMetadata("hidden", True)
+
+    return xf
 
 
 def _prototype_key_for_target(target_obj):
