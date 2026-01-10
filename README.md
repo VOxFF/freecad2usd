@@ -12,11 +12,10 @@ render, or simulate the scene in tools like `usdview`, Omniverse, or other USD-b
 
 - Export the **active FreeCAD document** or **selected objects** to USD
 - Supports ASCII (`.usda`) or binary (`.usd`) files (depending on your implementation)
-- Keeps a simple hierarchical structure that mirrors FreeCAD objects
+- Keeps hierarchical structure that mirrors FreeCAD objects
 - Supports the following FreeCAD features:
   - Native FreeCAD **parametric shapes**
   - **Meshes**
-  - **Hierarchies**
   - **Clones**
   - **Links**
 
