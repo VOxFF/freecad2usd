@@ -95,3 +95,6 @@ Open the resulting file in usdview:
 ```bash
 usdview my_model.usda
 ```
+
+![FreeCAD → USD Export Demo](images/demo1.gif)
+
