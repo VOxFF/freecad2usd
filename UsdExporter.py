@@ -1,6 +1,12 @@
-import sys, os
+"""
+FreeCAD to USD Exporter.
+
+Exports FreeCAD documents to Universal Scene Description (USD) format.
+"""
+
+import sys
+import os
 import re
-import math
 
 import FreeCAD
 import FreeCADGui
@@ -10,61 +16,42 @@ usd_python_path = os.path.expanduser('~/usd_install/lib/python')
 if usd_python_path not in sys.path:
     sys.path.append(usd_python_path)
 
-from pxr import Usd, UsdGeom, UsdShade, Gf, Sdf
+from pxr import Usd, UsdGeom, Gf, Sdf
+
+# Import sibling modules (FreeCAD puts Mod folder on sys.path)
+import Materials
+import Geometry
 
 
-# If True, convert tessellated points into prim-local space by applying inverse(globalPlacement)
+# ----------------------------
+# Configuration
+# ----------------------------
+
 UNBAKE_POINTS_TO_LOCAL = True
 
 
 # ----------------------------
-# Link prototypes cache
+# Prototype cache
 # ----------------------------
+
 PROTOTYPE_CACHE = {}  # key: (docName, targetName) -> Sdf.Path
 PROTOTYPES_ROOT_PATH = Sdf.Path("/Scene/__Prototypes")
 
-MATERIAL_CACHE = {}   # key: (r, g, b, sr, sg, sb, roughness, opacity) -> Sdf.Path
-MATERIALS_ROOT_PATH = Sdf.Path("/Scene/__Materials")
-
 
 # ----------------------------
-# Debug helpers
-# ----------------------------
-
-def _quat_xyzw(pl: FreeCAD.Placement):
-    """
-    FreeCAD Rotation.Q is (x, y, z, w) (NOT w,x,y,z).
-    """
-    q = pl.Rotation.Q
-    return (q[0], q[1], q[2], q[3])  # x,y,z,w
-
-
-def _pl_str(pl):
-    try:
-        b = pl.Base
-        x, y, z, w = _quat_xyzw(pl)
-        return f"T=({b.x:.3f},{b.y:.3f},{b.z:.3f}) Qxyzw=({x:.6f},{y:.6f},{z:.6f},{w:.6f})"
-    except Exception:
-        return "<bad placement>"
-
-
-def _bbox(pts_):
-    if not pts_:
-        return None
-    xs = [p.x for p in pts_]
-    ys = [p.y for p in pts_]
-    zs = [p.z for p in pts_]
-    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
-
-
-# ----------------------------
-# Export entry
+# Export entry point
 # ----------------------------
 
 def export(objects, filename):
-    # cache must be per-export/stage
+    """
+    Export FreeCAD objects to a USD file.
+
+    Args:
+        objects: List of FreeCAD objects to export, or None for all objects
+        filename: Output USD file path (.usd, .usda, .usdc)
+    """
     PROTOTYPE_CACHE.clear()
-    MATERIAL_CACHE.clear()
+    Materials.clear_cache()
 
     if not objects:
         doc = FreeCAD.ActiveDocument
@@ -73,23 +60,21 @@ def export(objects, filename):
     stage = Usd.Stage.CreateNew(filename)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
-    # Optional: FreeCAD is typically mm.
-    # UsdGeom.SetStageMetersPerUnit(stage, 0.001)
-
     root = UsdGeom.Xform.Define(stage, "/Scene")
 
     identity = FreeCAD.Placement()
     for obj in objects:
-        export_object_recursive(obj, root, stage, parent_global=identity, is_prototype_root=False)
+        _export_object_recursive(obj, root, stage, parent_global=identity, is_prototype_root=False)
 
     stage.GetRootLayer().Save()
 
 
 # ----------------------------
-# Utils
+# Utilities
 # ----------------------------
 
-def make_usd_safe(name: str) -> str:
+def _make_usd_safe(name):
+    """Sanitize a name for use as a USD prim name."""
     name = (name or "").strip() or "Object"
     name = re.sub(r'[^A-Za-z0-9_]', '_', name)
     if name[0].isdigit():
@@ -97,8 +82,10 @@ def make_usd_safe(name: str) -> str:
     return name
 
 
-def get_children(obj):
+def _get_children(obj):
     """
+    Get child objects for traversal.
+
     Normal objects: Group + OutList.
     Links: do NOT traverse OutList (proxy/dependency graph), only Group if any.
     """
@@ -124,10 +111,8 @@ def get_children(obj):
     return children
 
 
-def get_global_placement(obj, parent_global: FreeCAD.Placement):
-    """
-    Prefer FreeCAD's global placement if available. Otherwise, approximate by chaining.
-    """
+def _get_global_placement(obj, parent_global):
+    """Get the global placement of an object."""
     if hasattr(obj, "getGlobalPlacement"):
         try:
             return obj.getGlobalPlacement()
@@ -143,40 +128,28 @@ def get_global_placement(obj, parent_global: FreeCAD.Placement):
     return parent_global
 
 
-def placement_inverse(pl: FreeCAD.Placement) -> FreeCAD.Placement:
-    return pl.inverse()
-
-
-def placement_to_usd_ops(xform: UsdGeom.Xform, pl: FreeCAD.Placement):
+def _placement_to_usd_ops(xform, pl):
     """
-    Author local transform for this prim (relative to parent) using T + Orient.
-    IMPORTANT: FreeCAD quaternion is (x,y,z,w). USD expects (w, x, y, z) for Gf.Quat*.
+    Author local transform for a prim using translate + orient ops.
+
+    Note: FreeCAD quaternion is (x,y,z,w), USD Gf.Quatf expects (w,x,y,z).
     """
     pos = pl.Base
-    x, y, z, w = _quat_xyzw(pl)
+    q = pl.Rotation.Q  # (x, y, z, w)
 
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(pos.x, pos.y, pos.z))
-    xform.AddOrientOp().Set(Gf.Quatf(w, x, y, z))
-
-
-def transform_point_by_placement_inv(p: FreeCAD.Vector, pl: FreeCAD.Placement) -> FreeCAD.Vector:
-    """
-    Apply inverse placement to a point (world -> local).
-    """
-    inv = pl.inverse()
-    return inv.multVec(p)
+    xform.AddOrientOp().Set(Gf.Quatf(q[3], q[0], q[1], q[2]))  # w, x, y, z
 
 
 # ----------------------------
-# Link + prototypes helpers
+# Link / prototype helpers
 # ----------------------------
 
 def _get_linked_object(obj):
-    # Standard FreeCAD Link API
+    """Get the linked object from an App::Link."""
     if hasattr(obj, "LinkedObject"):
         return obj.LinkedObject
-    # Some variants may expose 'Link'
     if hasattr(obj, "Link"):
         return obj.Link
     return None
@@ -198,17 +171,15 @@ def _resolve_link_chain(obj):
 
 
 def _get_prototypes_root(stage):
+    """Create or get the hidden __Prototypes container."""
     xf = UsdGeom.Xform.Define(stage, str(PROTOTYPES_ROOT_PATH))
-
-    # Hide in render (applies only to this container, not to instances)
     UsdGeom.Imageable(xf.GetPrim()).GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
-    # Hide in usdview tree UI 
     xf.GetPrim().SetMetadata("hidden", True)
-
     return xf
 
 
 def _prototype_key_for_target(target_obj):
+    """Create a cache key for a prototype target."""
     doc = getattr(target_obj, "Document", None)
     doc_name = getattr(doc, "Name", "Doc")
     return (doc_name, getattr(target_obj, "Name", "Obj"))
@@ -224,22 +195,19 @@ def _ensure_prototype_for_target(target_obj, stage):
 
     protos_root = _get_prototypes_root(stage)
 
-    proto_name = "Proto_" + make_usd_safe(getattr(target_obj, "Label", "") or target_obj.Name)
+    proto_name = "Proto_" + _make_usd_safe(getattr(target_obj, "Label", "") or target_obj.Name)
     proto_path = protos_root.GetPath().AppendChild(proto_name)
 
-    # If already exists in stage, reuse
     if stage.GetPrimAtPath(proto_path):
         PROTOTYPE_CACHE[key] = proto_path
         return proto_path
 
-    # Create prototype root prim (identity)
     proto_xf = UsdGeom.Xform.Define(stage, proto_path)
     proto_xf.ClearXformOpOrder()
 
-    # Baseline = target global placement so target local becomes identity in prototype
-    target_global = get_global_placement(target_obj, FreeCAD.Placement())
+    target_global = _get_global_placement(target_obj, FreeCAD.Placement())
 
-    export_object_recursive(
+    _export_object_recursive(
         target_obj,
         proto_xf,
         stage,
@@ -254,7 +222,6 @@ def _ensure_prototype_for_target(target_obj, stage):
 def _get_single_link_child(obj):
     """
     Detect wrapper: object that isn't App::Link but has exactly one App::Link child.
-    We'll treat wrapper itself as the instance node and avoid nested link prim hierarchy.
     """
     kids = []
     if hasattr(obj, "Group") and obj.Group:
@@ -262,12 +229,8 @@ def _get_single_link_child(obj):
     if hasattr(obj, "OutList") and obj.OutList:
         kids.extend(obj.OutList)
 
-    uniq = []
     seen = set()
-    for k in kids:
-        if id(k) not in seen:
-            uniq.append(k)
-            seen.add(id(k))
+    uniq = [k for k in kids if not (id(k) in seen or seen.add(id(k)))]
 
     link_kids = [k for k in uniq if getattr(k, "TypeId", "").startswith("App::Link")]
     return link_kids[0] if len(link_kids) == 1 else None
@@ -289,12 +252,10 @@ def _get_clone_base_object(obj):
         if v is None:
             continue
 
-        # list/tuple
         if isinstance(v, (list, tuple)):
             if len(v) == 0:
                 continue
             v0 = v[0]
-            # sometimes stored as (obj, subname)
             if isinstance(v0, (list, tuple)) and len(v0) > 0:
                 v0 = v0[0]
             return v0
@@ -331,548 +292,127 @@ def _resolve_to_link_if_any(obj, max_hops=6):
 
 
 # ----------------------------
-# Material helpers
-# ----------------------------
-
-def _get_materials_root(stage):
-    xf = UsdGeom.Xform.Define(stage, str(MATERIALS_ROOT_PATH))
-    UsdGeom.Imageable(xf.GetPrim()).GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
-    xf.GetPrim().SetMetadata("hidden", True)
-    return xf
-
-
-def _extract_material_properties(obj):
-    """
-    Read diffuse color, specular color, roughness, and opacity from a FreeCAD object's ViewObject.
-    Returns a dict or None if no color data is available.
-    """
-    vo = getattr(obj, "ViewObject", None)
-    if vo is None:
-        return None
-
-    # Diffuse color: try DiffuseColor list first, fall back to ShapeColor
-    diffuse = None
-    dc = getattr(vo, "DiffuseColor", None)
-    if dc and isinstance(dc, (list, tuple)) and len(dc) > 0:
-        # DiffuseColor is a list of (r, g, b, a) per face; take the first
-        c = dc[0]
-        if isinstance(c, (list, tuple)) and len(c) >= 3:
-            diffuse = (float(c[0]), float(c[1]), float(c[2]))
-
-    if diffuse is None:
-        sc = getattr(vo, "ShapeColor", None)
-        if sc and isinstance(sc, (list, tuple)) and len(sc) >= 3:
-            diffuse = (float(sc[0]), float(sc[1]), float(sc[2]))
-
-    if diffuse is None:
-        return None
-
-    # Opacity from Transparency (0-100 integer -> 0.0-1.0 opacity)
-    transparency = getattr(vo, "Transparency", 0)
-    if isinstance(transparency, (int, float)):
-        opacity = 1.0 - (float(transparency) / 100.0)
-    else:
-        opacity = 1.0
-
-    # Specular + shininess from ShapeMaterial if available
-    specular = (0.5, 0.5, 0.5)
-    roughness = 0.5
-    mat = getattr(vo, "ShapeMaterial", None)
-    if mat is not None:
-        spec = getattr(mat, "SpecularColor", None)
-        if spec and hasattr(spec, "r"):
-            specular = (float(spec.r), float(spec.g), float(spec.b))
-        elif isinstance(spec, (list, tuple)) and len(spec) >= 3:
-            specular = (float(spec[0]), float(spec[1]), float(spec[2]))
-
-        shininess = getattr(mat, "Shininess", None)
-        if isinstance(shininess, (int, float)):
-            roughness = 1.0 - max(0.0, min(1.0, float(shininess)))
-
-    return {
-        "diffuse": diffuse,
-        "specular": specular,
-        "roughness": round(roughness, 4),
-        "opacity": round(opacity, 4),
-    }
-
-
-def _material_cache_key(props):
-    d = props["diffuse"]
-    s = props["specular"]
-    return (
-        round(d[0], 3), round(d[1], 3), round(d[2], 3),
-        round(s[0], 3), round(s[1], 3), round(s[2], 3),
-        round(props["roughness"], 3),
-        round(props["opacity"], 3),
-    )
-
-
-def _ensure_material(stage, props):
-    """
-    Create or reuse a UsdPreviewSurface material under /Scene/__Materials.
-    """
-    key = _material_cache_key(props)
-    if key in MATERIAL_CACHE:
-        return UsdShade.Material.Get(stage, MATERIAL_CACHE[key])
-
-    mats_root = _get_materials_root(stage)
-
-    # Name based on diffuse color to keep it readable
-    d = props["diffuse"]
-    mat_name = "Mat_{:02X}{:02X}{:02X}".format(
-        int(d[0] * 255), int(d[1] * 255), int(d[2] * 255)
-    )
-    # Disambiguate if needed (different specular/roughness/opacity for same diffuse)
-    mat_path = mats_root.GetPath().AppendChild(mat_name)
-    if stage.GetPrimAtPath(mat_path) and key not in MATERIAL_CACHE:
-        suffix = 1
-        while stage.GetPrimAtPath(mats_root.GetPath().AppendChild(mat_name + f"_{suffix}")):
-            suffix += 1
-        mat_name = mat_name + f"_{suffix}"
-        mat_path = mats_root.GetPath().AppendChild(mat_name)
-
-    material = UsdShade.Material.Define(stage, mat_path)
-
-    # Create UsdPreviewSurface shader
-    shader_path = mat_path.AppendChild("PreviewSurface")
-    shader = UsdShade.Shader.Define(stage, shader_path)
-    shader.CreateIdAttr("UsdPreviewSurface")
-
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-        Gf.Vec3f(*props["diffuse"])
-    )
-    shader.CreateInput("specularColor", Sdf.ValueTypeNames.Color3f).Set(
-        Gf.Vec3f(*props["specular"])
-    )
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(props["roughness"])
-    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(props["opacity"])
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-
-    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-
-    MATERIAL_CACHE[key] = mat_path
-    FreeCAD.Console.PrintMessage(
-        f"    [mat] Created material '{mat_name}' diffuse={props['diffuse']} "
-        f"spec={props['specular']} rough={props['roughness']} opacity={props['opacity']}\n"
-    )
-    return material
-
-
-# ----------------------------
 # Main recursive exporter
 # ----------------------------
 
-def export_object_recursive(obj, parent_xform, stage, parent_global: FreeCAD.Placement, is_prototype_root=False):
+def _export_object_recursive(obj, parent_xform, stage, parent_global, is_prototype_root=False):
+    """Recursively export a FreeCAD object and its children to USD."""
     type_id = getattr(obj, "TypeId", "")
     label = getattr(obj, "Label", "") or getattr(obj, "Name", "")
-    usd_name = make_usd_safe(label)
+    usd_name = _make_usd_safe(label)
 
     FreeCAD.Console.PrintMessage(
         f"[USD] Exporting: Label='{label}'  Name='{getattr(obj,'Name','')}'  TypeId='{type_id}'\n"
     )
 
-    # Create Xform for this object under its parent
+    # Create Xform for this object
     this_path = parent_xform.GetPath().AppendChild(usd_name)
     this_xform = UsdGeom.Xform.Define(stage, this_path)
 
     # Compute placements
-    child_global = get_global_placement(obj, parent_global)
+    child_global = _get_global_placement(obj, parent_global)
 
     if is_prototype_root:
-        # Prototype root: force identity local transform
         local_to_parent = FreeCAD.Placement()
     else:
-        parent_global_inv = placement_inverse(parent_global)
-        local_to_parent = parent_global_inv.multiply(child_global)
+        local_to_parent = parent_global.inverse().multiply(child_global)
 
-    # DEBUG: placements + embedded shape placement
-    FreeCAD.Console.PrintMessage(
-        f"    parent_global   : {_pl_str(parent_global)}\n"
-        f"    child_global    : {_pl_str(child_global)}\n"
-        f"    local_to_parent : {_pl_str(local_to_parent)}\n"
-    )
-    if hasattr(obj, "Shape") and getattr(obj, "Shape", None) and not obj.Shape.isNull():
-        try:
-            FreeCAD.Console.PrintMessage(f"    shape.Placement : {_pl_str(obj.Shape.Placement)}\n")
-        except Exception:
-            FreeCAD.Console.PrintMessage("    shape.Placement : <unavailable>\n")
+    _placement_to_usd_ops(this_xform, local_to_parent)
 
-    placement_to_usd_ops(this_xform, local_to_parent)
-    FreeCAD.Console.PrintMessage(f"    USD xform authored: {_pl_str(local_to_parent)}\n")
+    # Extract material
+    mat_props = Materials.extract_material_properties(obj)
+    usd_material = Materials.ensure_material(stage, mat_props) if mat_props else None
 
-    # Extract material properties for mesh binding
-    mat_props = _extract_material_properties(obj)
-    usd_material = _ensure_material(stage, mat_props) if mat_props else None
-
-    # ------------------------------------------------------------------
-    # 1) Clone-of-link wrapper (single App::Link child) -> instance here
-    # ------------------------------------------------------------------
+    # --- Handle link/clone instances ---
     if not is_prototype_root:
+        # Single App::Link child wrapper
         link_child = _get_single_link_child(obj)
         if link_child is not None and not type_id.startswith("App::Link"):
             target = _resolve_link_chain(link_child)
-            if target is None:
-                FreeCAD.Console.PrintMessage("  -> Link-wrapper has broken target, skipping\n")
+            if target:
+                proto_path = _ensure_prototype_for_target(target, stage)
+                prim = this_xform.GetPrim()
+                prim.GetReferences().AddInternalReference(proto_path)
+                prim.SetInstanceable(True)
+            return
+
+        # FeaturePython clone pointing to App::Link
+        if type_id.startswith("Part::FeaturePython"):
+            link_obj = _resolve_to_link_if_any(obj)
+            if link_obj is not None:
+                target = _resolve_link_chain(link_obj)
+                if target:
+                    proto_path = _ensure_prototype_for_target(target, stage)
+                    prim = this_xform.GetPrim()
+                    prim.GetReferences().AddInternalReference(proto_path)
+                    prim.SetInstanceable(True)
                 return
 
-            proto_path = _ensure_prototype_for_target(target, stage)
-            prim = this_xform.GetPrim()
-            prim.GetReferences().AddInternalReference(proto_path)
-            prim.SetInstanceable(True)
+        # Direct App::Link
+        if type_id.startswith("App::Link"):
+            target = _resolve_link_chain(obj)
+            if target:
+                proto_path = _ensure_prototype_for_target(target, stage)
+                prim = this_xform.GetPrim()
+                prim.GetReferences().AddInternalReference(proto_path)
+                prim.SetInstanceable(True)
             return
 
-    # ------------------------------------------------------------------
-    # 2) FeaturePython clone that ultimately points to an App::Link
-    #    (this fixes your 'Clone005' case)
-    # ------------------------------------------------------------------
-    if type_id.startswith("Part::FeaturePython") and not is_prototype_root:
-        link_obj = _resolve_to_link_if_any(obj)
-        if link_obj is not None:
-            target = _resolve_link_chain(link_obj)
-            if target is None:
-                FreeCAD.Console.PrintMessage("  -> Clone-of-link has broken target, skipping\n")
-                return
+    # --- Handle geometry ---
+    mesh_name = usd_name + "_mesh"
 
-            proto_path = _ensure_prototype_for_target(target, stage)
-            prim = this_xform.GetPrim()
-            prim.GetReferences().AddInternalReference(proto_path)
-            prim.SetInstanceable(True)
-
-            # Do NOT export baked Shape and do NOT recurse.
-            return
-
-    # ------------------------------------------------------------------
-    # 3) App::Link itself -> instance of prototype
-    # ------------------------------------------------------------------
-    if type_id.startswith("App::Link") and not is_prototype_root:
-        target = _resolve_link_chain(obj)
-        if target is None:
-            FreeCAD.Console.PrintMessage("  -> App::Link has broken target, skipping\n")
-            return
-
-        proto_path = _ensure_prototype_for_target(target, stage)
-        prim = this_xform.GetPrim()
-        prim.GetReferences().AddInternalReference(proto_path)
-        prim.SetInstanceable(True)
-        return
-
-    # -------------------------
-    # Containers only
-    # -------------------------
-    if type_id.startswith("App::Part"):
-        FreeCAD.Console.PrintMessage("  -> App::Part, container only\n")
-
-    elif ("DocumentObjectGroup" in type_id) or ("GeoFeatureGroup" in type_id) or (
-        hasattr(obj, "Group")
-        and getattr(obj, "Group")
-        and not hasattr(obj, "Shape")
-        and not hasattr(obj, "Mesh")
-    ):
-        FreeCAD.Console.PrintMessage("  -> Group, container only\n")
-
-    # -------------------------
-    # PartDesign::Body (one mesh, no recursion into features)
-    # -------------------------
-    elif type_id == "PartDesign::Body":
+    if type_id == "PartDesign::Body":
         if hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> PartDesign::Body, exporting Body.Shape as mesh\n")
-            mesh_name = usd_name + "_mesh"
-
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
+            Geometry.tessellate_shape_to_usd(
+                obj.Shape, stage, this_xform, mesh_name,
+                tess_tolerance=0.1,
                 angle_threshold=10.0,
-                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
-                unbake_using_global_placement=child_global,
+                unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
+                global_placement=child_global,
                 material=usd_material,
             )
-        else:
-            FreeCAD.Console.PrintMessage("  -> PartDesign::Body has no valid Shape\n")
-        return
+        return  # Don't recurse into PartDesign features
 
-    # -------------------------
-    # Mesh::Feature (use existing triangulation)
-    # -------------------------
     elif type_id.startswith("Mesh::Feature"):
-        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
-            FreeCAD.Console.PrintMessage("  -> Mesh::Feature, exporting original Mesh\n")
-            mesh_name = usd_name + "_mesh"
-
-            original_mesh_with_normals_to_usd(
-                obj.Mesh,
-                stage,
-                this_xform,
-                mesh_name,
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None):
+            Geometry.mesh_to_usd(
+                obj.Mesh, stage, this_xform, mesh_name,
                 angle_threshold=10.0,
                 material=usd_material,
             )
-        else:
-            FreeCAD.Console.PrintMessage("  -> Mesh::Feature has no facets\n")
 
-    # -------------------------
-    # Part::Feature (tessellate)
-    # -------------------------
     elif type_id.startswith("Part::Feature"):
         if hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> Part::Feature, exporting tessellated Shape\n")
-            mesh_name = usd_name + "_mesh"
-
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
+            Geometry.tessellate_shape_to_usd(
+                obj.Shape, stage, this_xform, mesh_name,
+                tess_tolerance=0.1,
                 angle_threshold=10.0,
-                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
-                unbake_using_global_placement=child_global,
+                unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
+                global_placement=child_global,
                 material=usd_material,
             )
-        else:
-            FreeCAD.Console.PrintMessage("  -> Part::Feature has no valid Shape\n")
 
-    # -------------------------
-    # Fallback
-    # -------------------------
-    else:
-        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None) and obj.Mesh.Facets:
-            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Mesh property\n")
-            mesh_name = usd_name + "_mesh"
-            original_mesh_with_normals_to_usd(
-                obj.Mesh,
-                stage,
-                this_xform,
-                mesh_name,
+    elif not type_id.startswith("App::Part") and "Group" not in type_id:
+        # Fallback: try Mesh, then Shape
+        if hasattr(obj, "Mesh") and getattr(obj.Mesh, "Facets", None):
+            Geometry.mesh_to_usd(
+                obj.Mesh, stage, this_xform, mesh_name,
                 angle_threshold=10.0,
                 material=usd_material,
             )
         elif hasattr(obj, "Shape") and not obj.Shape.isNull():
-            FreeCAD.Console.PrintMessage("  -> unknown type, exporting Shape via tessellation\n")
-            mesh_name = usd_name + "_mesh"
-            tessellated_mesh_with_normals_to_usd(
-                obj.Shape,
-                stage,
-                this_xform,
-                mesh_name,
-                tess_tol=0.1,
+            Geometry.tessellate_shape_to_usd(
+                obj.Shape, stage, this_xform, mesh_name,
+                tess_tolerance=0.1,
                 angle_threshold=10.0,
-                unbake_points_to_local=UNBAKE_POINTS_TO_LOCAL,
-                unbake_using_global_placement=child_global,
+                unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
+                global_placement=child_global,
                 material=usd_material,
             )
-        else:
-            FreeCAD.Console.PrintMessage("  -> no Mesh/Shape, container only\n")
 
-    # recurse into children
-    for child in get_children(obj):
+    # Recurse into children
+    for child in _get_children(obj):
         vo = getattr(child, "ViewObject", None)
         if vo and not vo.Visibility:
             continue
-        export_object_recursive(child, this_xform, stage, parent_global=child_global, is_prototype_root=False)
-
-
-# ----------------------------
-# Mesh export helpers
-# ----------------------------
-
-def tessellated_mesh_with_normals_to_usd(
-    shape,
-    stage,
-    parent_xform,
-    usd_name,
-    tess_tol=0.1,
-    angle_threshold=30.0,
-    unbake_points_to_local=False,
-    unbake_using_global_placement=None,
-    material=None,
-):
-    pts, faces = shape.tessellate(tess_tol)
-
-    bb0 = _bbox(pts)
-    if bb0:
-        FreeCAD.Console.PrintMessage(
-            f"    [tess] '{usd_name}' raw bbox: "
-            f"min=({bb0[0]:.3f},{bb0[1]:.3f},{bb0[2]:.3f}) "
-            f"max=({bb0[3]:.3f},{bb0[4]:.3f},{bb0[5]:.3f})\n"
-        )
-
-    if unbake_points_to_local and unbake_using_global_placement is not None:
-        pts_local = [transform_point_by_placement_inv(p, unbake_using_global_placement) for p in pts]
-        bb1 = _bbox(pts_local)
-        if bb1:
-            FreeCAD.Console.PrintMessage(
-                f"    [tess] '{usd_name}' unbaked bbox: "
-                f"min=({bb1[0]:.3f},{bb1[1]:.3f},{bb1[2]:.3f}) "
-                f"max=({bb1[3]:.3f},{bb1[4]:.3f},{bb1[5]:.3f})\n"
-            )
-        FreeCAD.Console.PrintMessage(
-            f"    [tess] '{usd_name}' unbake using global: {_pl_str(unbake_using_global_placement)}\n"
-        )
-
-        points = [(p.x, p.y, p.z) for p in pts_local]
-        pts_for_normals = pts_local
-    else:
-        points = [(p.x, p.y, p.z) for p in pts]
-        pts_for_normals = pts
-
-    faceVertexIndices = []
-    faceVertexCounts = []
-    for f in faces:
-        faceVertexIndices.extend(f)
-        faceVertexCounts.append(len(f))
-
-    # Face normals
-    face_normals = []
-    for f in faces:
-        if len(f) < 3:
-            face_normals.append(FreeCAD.Vector(0, 0, 0))
-            continue
-
-        v0 = pts_for_normals[f[0]]
-        v1 = pts_for_normals[f[1]]
-        v2 = pts_for_normals[f[2]]
-
-        n = (v1 - v0).cross(v2 - v0)
-        if n.Length > 0:
-            n.normalize()
-        face_normals.append(n)
-
-    # Vertex -> incident faces
-    vertex_faces = {i: [] for i in range(len(pts_for_normals))}
-    for fi, f in enumerate(faces):
-        for vi in f:
-            vertex_faces[vi].append(fi)
-
-    cos_threshold = math.cos(math.radians(angle_threshold))
-    face_vertex_normals = []
-
-    for fi, f in enumerate(faces):
-        n_face = face_normals[fi]
-        if n_face.Length == 0:
-            for _ in f:
-                face_vertex_normals.append((0.0, 0.0, 0.0))
-            continue
-
-        for vi in f:
-            accum = FreeCAD.Vector(0, 0, 0)
-            for adj_fi in vertex_faces[vi]:
-                n_adj = face_normals[adj_fi]
-                if n_adj.Length == 0:
-                    continue
-                if n_face.dot(n_adj) >= cos_threshold:
-                    accum = accum.add(n_adj)
-
-            if accum.Length == 0:
-                n = FreeCAD.Vector(n_face)
-            else:
-                n = accum
-                n.normalize()
-
-            face_vertex_normals.append((n.x, n.y, n.z))
-
-    prim_path = parent_xform.GetPath().AppendChild(usd_name)
-    usd_mesh = UsdGeom.Mesh.Define(stage, prim_path)
-
-    usd_mesh.CreateSubdivisionSchemeAttr().Set("none")
-    usd_mesh.CreateFaceVaryingLinearInterpolationAttr().Set("none")
-    usd_mesh.CreateInterpolateBoundaryAttr().Set("none")
-
-    usd_mesh.CreatePointsAttr(points)
-    usd_mesh.CreateFaceVertexIndicesAttr(faceVertexIndices)
-    usd_mesh.CreateFaceVertexCountsAttr(faceVertexCounts)
-
-    usd_mesh.CreateNormalsAttr(face_vertex_normals)
-    usd_mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
-
-    if material is not None:
-        UsdShade.MaterialBindingAPI.Apply(usd_mesh.GetPrim())
-        UsdShade.MaterialBindingAPI(usd_mesh.GetPrim()).Bind(material)
-
-    return usd_mesh
-
-
-def original_mesh_with_normals_to_usd(
-    mesh,
-    stage,
-    parent_xform,
-    usd_name,
-    angle_threshold=30.0,
-    material=None,
-):
-    pts = mesh.Points
-    facets = mesh.Facets
-
-    points = [(p.x, p.y, p.z) for p in pts]
-
-    faces = []
-    for f in facets:
-        faces.append(tuple(i - 1 for i in f.PointIndices))  # 1-based -> 0-based
-
-    faceVertexIndices = []
-    faceVertexCounts = []
-    for f in faces:
-        faceVertexIndices.extend(f)
-        faceVertexCounts.append(len(f))
-
-    face_normals = []
-    for facet in facets:
-        n = FreeCAD.Vector(facet.Normal)
-        if n.Length > 0:
-            n.normalize()
-        face_normals.append(n)
-
-    vertex_faces = {i: [] for i in range(len(pts))}
-    for fi, f in enumerate(faces):
-        for vi in f:
-            vertex_faces[vi].append(fi)
-
-    cos_threshold = math.cos(math.radians(angle_threshold))
-    face_vertex_normals = []
-
-    for fi, f in enumerate(faces):
-        n_face = face_normals[fi]
-        if n_face.Length == 0:
-            for _ in f:
-                face_vertex_normals.append((0.0, 0.0, 0.0))
-            continue
-
-        for vi in f:
-            accum = FreeCAD.Vector(0, 0, 0)
-            for adj_fi in vertex_faces[vi]:
-                n_adj = face_normals[adj_fi]
-                if n_adj.Length == 0:
-                    continue
-                if n_face.dot(n_adj) >= cos_threshold:
-                    accum = accum.add(n_adj)
-
-            if accum.Length == 0:
-                n = FreeCAD.Vector(n_face)
-            else:
-                n = accum
-                n.normalize()
-
-            face_vertex_normals.append((n.x, n.y, n.z))
-
-    prim_path = parent_xform.GetPath().AppendChild(usd_name)
-    usd_mesh = UsdGeom.Mesh.Define(stage, prim_path)
-
-    usd_mesh.CreateSubdivisionSchemeAttr().Set("none")
-    usd_mesh.CreateFaceVaryingLinearInterpolationAttr().Set("none")
-    usd_mesh.CreateInterpolateBoundaryAttr().Set("none")
-
-    usd_mesh.CreatePointsAttr(points)
-    usd_mesh.CreateFaceVertexIndicesAttr(faceVertexIndices)
-    usd_mesh.CreateFaceVertexCountsAttr(faceVertexCounts)
-
-    usd_mesh.CreateNormalsAttr(face_vertex_normals)
-    usd_mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
-
-    if material is not None:
-        UsdShade.MaterialBindingAPI.Apply(usd_mesh.GetPrim())
-        UsdShade.MaterialBindingAPI(usd_mesh.GetPrim()).Bind(material)
-
-    return usd_mesh
+        _export_object_recursive(child, this_xform, stage, parent_global=child_global, is_prototype_root=False)
