@@ -18,6 +18,7 @@ if usd_python_path not in sys.path:
 from pxr import UsdGeom
 
 import Geometry
+import Prototypes
 
 
 # ----------------------------
@@ -161,9 +162,7 @@ def _export_link(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.Plac
     target = _resolve_link_chain(obj)
     if target and ctx.ensure_prototype:
         proto_path = ctx.ensure_prototype(target, ctx.stage)
-        prim = this_xform.GetPrim()
-        prim.GetReferences().AddInternalReference(proto_path)
-        prim.SetInstanceable(True)
+        Prototypes.make_instance(this_xform.GetPrim(), proto_path)
     return False
 
 
@@ -176,9 +175,7 @@ def _export_feature_python(obj, ctx, this_xform: UsdGeom.Xform, child_global: Fr
             target = _resolve_link_chain(link_obj)
             if target and ctx.ensure_prototype:
                 proto_path = ctx.ensure_prototype(target, ctx.stage)
-                prim = this_xform.GetPrim()
-                prim.GetReferences().AddInternalReference(proto_path)
-                prim.SetInstanceable(True)
+                Prototypes.make_instance(this_xform.GetPrim(), proto_path)
             return False
 
     # Otherwise treat as Part::Feature

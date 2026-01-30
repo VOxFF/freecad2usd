@@ -9,7 +9,7 @@ import sys
 import os
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Callable
 
 import FreeCAD
@@ -24,6 +24,7 @@ from pxr import Usd, UsdGeom, Gf, Sdf
 
 # Import sibling modules
 import Materials
+import Prototypes
 import Registry
 
 
@@ -39,14 +40,6 @@ class ExportContext:
     parent_global: FreeCAD.Placement
     is_prototype_root: bool = False
     ensure_prototype: Optional[Callable] = None
-
-
-# ----------------------------
-# Caches
-# ----------------------------
-
-PROTOTYPE_CACHE = {}  # key: (docName, targetName) -> Sdf.Path
-PROTOTYPES_ROOT_PATH = Sdf.Path("/Scene/__Prototypes")
 
 
 # ----------------------------
@@ -128,46 +121,16 @@ def _placement_to_usd_ops(xform: UsdGeom.Xform, pl: FreeCAD.Placement):
 
 
 # ----------------------------
-# Prototype helpers
+# Prototype export callback
 # ----------------------------
 
-def _get_prototypes_root(stage: Usd.Stage) -> UsdGeom.Xform:
-    """Create or get the hidden __Prototypes container."""
-    xf = UsdGeom.Xform.Define(stage, str(PROTOTYPES_ROOT_PATH))
-    UsdGeom.Imageable(xf.GetPrim()).GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
-    xf.GetPrim().SetMetadata("hidden", True)
-    return xf
-
-
-def _prototype_key_for_target(target_obj):
-    """Create a cache key for a prototype target."""
-    doc = getattr(target_obj, "Document", None)
-    doc_name = getattr(doc, "Name", "Doc")
-    return (doc_name, getattr(target_obj, "Name", "Obj"))
-
-
-def _ensure_prototype_for_target(target_obj, stage: Usd.Stage) -> Sdf.Path:
-    """Export target hierarchy under __Prototypes using BFS, return its path."""
-    key = _prototype_key_for_target(target_obj)
-    if key in PROTOTYPE_CACHE:
-        return PROTOTYPE_CACHE[key]
-
-    protos_root = _get_prototypes_root(stage)
-    proto_name = "Proto_" + _make_usd_safe(getattr(target_obj, "Label", "") or target_obj.Name)
-    proto_path = protos_root.GetPath().AppendChild(proto_name)
-
-    if stage.GetPrimAtPath(proto_path):
-        PROTOTYPE_CACHE[key] = proto_path
-        return proto_path
-
-    proto_xf = UsdGeom.Xform.Define(stage, proto_path)
-    proto_xf.ClearXformOpOrder()
-
-    target_global = _get_global_placement(target_obj, FreeCAD.Placement())
-
-    # BFS export for prototype subtree
+def _export_prototype_subtree(target_obj, proto_xf: UsdGeom.Xform, target_global: FreeCAD.Placement):
+    """
+    Export a prototype's subtree using BFS.
+    This is passed to Prototypes.ensure_prototype as a callback.
+    """
     ctx = ExportContext(
-        stage=stage,
+        stage=proto_xf.GetPrim().GetStage(),
         parent_xform=proto_xf,
         parent_global=target_global,
         is_prototype_root=True,
@@ -175,8 +138,10 @@ def _ensure_prototype_for_target(target_obj, stage: Usd.Stage) -> Sdf.Path:
     )
     _export_bfs([(target_obj, ctx)])
 
-    PROTOTYPE_CACHE[key] = proto_path
-    return proto_path
+
+def _ensure_prototype_for_target(target_obj, stage: Usd.Stage) -> Sdf.Path:
+    """Wrapper that calls Prototypes.ensure_prototype with our export callback."""
+    return Prototypes.ensure_prototype(target_obj, stage, _export_prototype_subtree)
 
 
 # ----------------------------
@@ -213,9 +178,7 @@ def _handle_link_wrapper(obj, ctx: ExportContext, this_xform: UsdGeom.Xform, typ
         target = Registry._resolve_link_chain(link_child)
         if target:
             proto_path = _ensure_prototype_for_target(target, ctx.stage)
-            prim = this_xform.GetPrim()
-            prim.GetReferences().AddInternalReference(proto_path)
-            prim.SetInstanceable(True)
+            Prototypes.make_instance(this_xform.GetPrim(), proto_path)
         return True
     return False
 
@@ -297,7 +260,7 @@ def export(objects, filename: str):
         objects: List of FreeCAD objects to export, or None for all objects
         filename: Output USD file path (.usd, .usda, .usdc)
     """
-    PROTOTYPE_CACHE.clear()
+    Prototypes.clear_cache()
     Materials.clear_cache()
 
     if not objects:
