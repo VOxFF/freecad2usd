@@ -255,8 +255,8 @@ def mesh_to_usd(
 
     points = [(p.x, p.y, p.z) for p in pts]
 
-    # Convert 1-based indices to 0-based
-    faces = [tuple(i - 1 for i in f.PointIndices) for f in facets]
+    # PointIndices are already 0-based
+    faces = [tuple(f.PointIndices) for f in facets]
 
     # Use facet normals directly
     face_normals = []
