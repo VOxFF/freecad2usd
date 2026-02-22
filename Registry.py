@@ -17,6 +17,7 @@ if usd_python_path not in sys.path:
 
 from pxr import UsdGeom
 
+import Billboard
 import Geometry
 import Prototypes
 
@@ -236,6 +237,27 @@ def _export_app_part(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.
 @exporter("App::DocumentObjectGroup", priority=50)
 def _export_group(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.Placement, usd_material) -> bool:
     """Export group as container only."""
+    return True
+
+
+@exporter("App::FeaturePython", priority=55)
+def _export_app_feature_python(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.Placement, usd_material) -> bool:
+    """Export App::FeaturePython - handles TextBillboard, falls through otherwise."""
+    if Billboard.is_text_billboard(obj):
+        Billboard.export_text_billboard(obj, this_xform)
+        return False
+
+    # Generic: try shape, then treat as container
+    if hasattr(obj, "Shape") and not obj.Shape.isNull():
+        mesh_name = _make_usd_safe(getattr(obj, "Label", "") or obj.Name) + "_mesh"
+        Geometry.tessellate_shape_to_usd(
+            obj.Shape, ctx.stage, this_xform, mesh_name,
+            tess_tolerance=0.1,
+            angle_threshold=10.0,
+            unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
+            global_placement=child_global,
+            material=usd_material,
+        )
     return True
 
 
