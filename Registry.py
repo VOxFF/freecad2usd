@@ -196,6 +196,8 @@ def _export_body(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.Plac
             global_placement=child_global,
             material=usd_material,
         )
+    else:
+        ctx.stage.RemovePrim(this_xform.GetPath())
     return False
 
 
@@ -222,7 +224,7 @@ def _export_part_feature(obj, ctx, this_xform: UsdGeom.Xform, child_global: Free
             tess_tolerance=0.1,
             angle_threshold=10.0,
             unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
-            global_placement=child_global,
+            global_placement=obj.Placement,
             material=usd_material,
         )
     return True
@@ -255,7 +257,7 @@ def _export_app_feature_python(obj, ctx, this_xform: UsdGeom.Xform, child_global
             tess_tolerance=0.1,
             angle_threshold=10.0,
             unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
-            global_placement=child_global,
+            global_placement=obj.Placement,
             material=usd_material,
         )
     return True
@@ -282,7 +284,7 @@ def _export_fallback(obj, ctx, this_xform: UsdGeom.Xform, child_global: FreeCAD.
             tess_tolerance=0.1,
             angle_threshold=10.0,
             unbake_to_local=UNBAKE_POINTS_TO_LOCAL,
-            global_placement=child_global,
+            global_placement=obj.Placement,
             material=usd_material,
         )
     return True
